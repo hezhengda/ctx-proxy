@@ -1016,10 +1016,22 @@ def print_usage_report(entries, title, plan_key):
     grand_calls      = sum(v["calls"]       for v in totals.values())
     grand_cache_read = sum(v["cache_read"]  for v in totals.values())
     grand_cache_write= sum(v["cache_write"] for v in totals.values())
-    # Effective tokens for plan-limit hour estimation: the model processes all
-    # context window tokens regardless of caching.  Cache reads are 10x cheaper
-    # in cost but still fill the context window, so we include them.
-    effective_in = grand_in + grand_cache_read + grand_cache_write
+    # Effective tokens for plan-limit hour estimation.
+    # Cache reads are billed at 0.1× the rate of input tokens (precomputed KV
+    # cache is ~10× cheaper to process).  We apply the same 0.1× weight here
+    # so the hour estimate reflects compute used, not raw context-window size.
+    # Cache writes count as normal input (they are fully computed on first use).
+    effective_in = grand_in + grand_cache_read * 0.1 + grand_cache_write
+
+    # Peak single-request context — what matters for the 5-hr window limit.
+    peak_ctx = 0
+    for e in entries:
+        u = e.get("usage", {}) or {}
+        ctx = (u.get("input_tokens", 0)
+               + u.get("cache_read_input_tokens", 0)
+               + u.get("cache_creation_input_tokens", 0))
+        if ctx > peak_ctx:
+            peak_ctx = ctx
 
     if HAS_RICH:
         from rich.columns import Columns
@@ -1051,18 +1063,18 @@ def print_usage_report(entries, title, plan_key):
         console.print(Columns(cards, equal=True))
 
         # ── Token breakdown ───────────────────────────────────────────────────
-        total_ctx = effective_in + grand_out
-        cache_pct = (grand_cache_read / effective_in * 100) if effective_in else 0
+        raw_total_ctx = grand_in + grand_cache_read + grand_cache_write
+        cache_pct = (grand_cache_read / raw_total_ctx * 100) if raw_total_ctx else 0
         console.print(
             f"  [bold]Context window:[/]  "
             f"[yellow]{grand_in:>12,}[/] [dim]input (new)[/]"
-            f"  [cyan]{grand_cache_read:>12,}[/] [dim]cache read  ({cache_pct:.0f}% of input)[/]"
+            f"  [cyan]{grand_cache_read:>12,}[/] [dim]cache read  ({cache_pct:.0f}% of ctx)[/]"
             f"  [dim]{grand_cache_write:>12,} cache write[/]"
         )
         console.print(
             f"  [bold]Output:        [/]  "
             f"[green]{grand_out:>12,}[/] [dim]tokens[/]"
-            f"  [dim]│  total context: {effective_in:,}  │  effective_in / 40k = {effective_in/40_000:.1f} est. hrs[/]"
+            f"  [dim]│  raw ctx: {raw_total_ctx:,}  │  weighted (0.1× cache_read): {int(effective_in):,}[/]"
         )
         console.print()
 
@@ -1074,11 +1086,12 @@ def print_usage_report(entries, title, plan_key):
         console.print(f"\n[bold]Plan:[/] [dim]{plan['label']}[/]")
 
         if wlim:
-            # 5-hour window: show against max single-request context as reference
-            bar, pct = _progress_bar(grand_in, wlim * 10)  # 10 windows as a loose daily ref
+            # 5-hr window: show peak single-request context vs the per-window cap.
+            # This tells you how close your biggest request came to the limit.
+            bar, pct = _progress_bar(peak_ctx, wlim)
             console.print(
-                f"  [dim]5-hr window limit[/]  {bar}  "
-                f"[dim]{wlim:,} tok/window[/]"
+                f"  [dim]5-hr window (peak) [/]  {bar}  "
+                f"[yellow]{peak_ctx:,}[/][dim] peak / {wlim:,} limit[/]"
             )
 
         if wson:
@@ -1098,7 +1111,7 @@ def print_usage_report(entries, title, plan_key):
                             if "opus" in e.get("model","").lower()]
             opus_effective = sum(
                 (e.get("usage") or {}).get("input_tokens", 0)
-                + (e.get("usage") or {}).get("cache_read_input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_read_input_tokens", 0) * 0.1
                 + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
                 for e in opus_entries
             )
@@ -1113,8 +1126,9 @@ def print_usage_report(entries, title, plan_key):
             console.print("  [dim]API plan: no weekly cap — billed per token[/]")
 
         console.print(
-            f"\n  [dim]Note: hour estimates = (input + cache_read + cache_write) ÷ 40k "
-            f"(all context-window tokens). Actual limits vary by task complexity.[/]\n"
+            f"\n  [dim]Note: hour estimates = (input + cache_write + cache_read×0.1) ÷ 40k  "
+            f"(cache reads weighted at 0.1× — their billing ratio). "
+            f"Actual limits vary by task complexity.[/]\n"
         )
 
     else:
@@ -1127,14 +1141,20 @@ def print_usage_report(entries, title, plan_key):
             if not t.get("calls"): continue
             print(f"  {label:<18}  calls={t['calls']:>4}  "
                   f"in={t['input']:>9,}  out={t['output']:>7,}")
-        cache_pct = (grand_cache_read / effective_in * 100) if effective_in else 0
+        raw_total_ctx = grand_in + grand_cache_read + grand_cache_write
+        cache_pct = (grand_cache_read / raw_total_ctx * 100) if raw_total_ctx else 0
         print(f"\n  Token breakdown:")
         print(f"    input (new)  : {grand_in:>12,}")
-        print(f"    cache read   : {grand_cache_read:>12,}  ({cache_pct:.0f}% of total context)")
+        print(f"    cache read   : {grand_cache_read:>12,}  ({cache_pct:.0f}% of raw ctx)")
         print(f"    cache write  : {grand_cache_write:>12,}")
         print(f"    output       : {grand_out:>12,}")
-        print(f"    total context: {effective_in:>12,}")
+        print(f"    raw ctx      : {raw_total_ctx:>12,}")
+        print(f"    weighted ctx : {int(effective_in):>12,}  (cache_read×0.1 for hr est.)")
         plan = PLAN_LIMITS.get(plan_key, PLAN_LIMITS["api"])
+        wlim = plan.get("window_tokens")
+        if wlim:
+            print(f"\n  5-hr window (peak): {_plain_bar(peak_ctx, wlim)}  "
+                  f"{peak_ctx:,} peak / {wlim:,} limit")
         wson = plan.get("weekly_sonnet")
         if wson:
             lo, hi = wson
@@ -1145,7 +1165,7 @@ def print_usage_report(entries, title, plan_key):
             lo, hi = wops
             opus_effective = sum(
                 (e.get("usage") or {}).get("input_tokens", 0)
-                + (e.get("usage") or {}).get("cache_read_input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_read_input_tokens", 0) * 0.1
                 + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
                 for e in entries if "opus" in e.get("model","").lower()
             )
