@@ -1023,15 +1023,21 @@ def print_usage_report(entries, title, plan_key):
     # Cache writes count as normal input (they are fully computed on first use).
     effective_in = grand_in + grand_cache_read * 0.1 + grand_cache_write
 
-    # Peak single-request context — what matters for the 5-hr window limit.
-    peak_ctx = 0
+    # Cumulative weighted tokens in the rolling 5-hour window — matches what
+    # Anthropic shows as "Current session" on the usage page.
+    from datetime import timedelta
+    window_start = datetime.now() - timedelta(hours=5)
+    window_used = 0
     for e in entries:
-        u = e.get("usage", {}) or {}
-        ctx = (u.get("input_tokens", 0)
-               + u.get("cache_read_input_tokens", 0)
-               + u.get("cache_creation_input_tokens", 0))
-        if ctx > peak_ctx:
-            peak_ctx = ctx
+        try:
+            ts_e = datetime.fromisoformat(e.get("ts", "")[:19])
+        except ValueError:
+            continue
+        if ts_e >= window_start:
+            u = e.get("usage", {}) or {}
+            window_used += (u.get("input_tokens", 0)
+                            + u.get("cache_read_input_tokens", 0) * 0.1
+                            + u.get("cache_creation_input_tokens", 0))
 
     if HAS_RICH:
         from rich.columns import Columns
@@ -1086,12 +1092,13 @@ def print_usage_report(entries, title, plan_key):
         console.print(f"\n[bold]Plan:[/] [dim]{plan['label']}[/]")
 
         if wlim:
-            # 5-hr window: show peak single-request context vs the per-window cap.
-            # This tells you how close your biggest request came to the limit.
-            bar, pct = _progress_bar(peak_ctx, wlim)
+            # Show rolling 5-hr usage without a progress bar — Anthropic's
+            # exact window budget is unknown (window_tokens is context-size cap,
+            # not the rolling budget).  Compare raw number to claude.ai usage page.
             console.print(
-                f"  [dim]5-hr window (peak) [/]  {bar}  "
-                f"[yellow]{peak_ctx:,}[/][dim] peak / {wlim:,} limit[/]"
+                f"  [dim]5-hr window (cur)  [/]  "
+                f"[yellow]{int(window_used):,}[/][dim] weighted tokens in last 5 hrs  "
+                f"(ctx cap: {wlim:,})[/]"
             )
 
         if wson:
@@ -1153,8 +1160,8 @@ def print_usage_report(entries, title, plan_key):
         plan = PLAN_LIMITS.get(plan_key, PLAN_LIMITS["api"])
         wlim = plan.get("window_tokens")
         if wlim:
-            print(f"\n  5-hr window (peak): {_plain_bar(peak_ctx, wlim)}  "
-                  f"{peak_ctx:,} peak / {wlim:,} limit")
+            print(f"\n  5-hr window (cur):  {int(window_used):,} weighted tokens in last 5 hrs"
+                  f"  (ctx cap: {wlim:,})")
         wson = plan.get("weekly_sonnet")
         if wson:
             lo, hi = wson
