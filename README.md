@@ -54,6 +54,7 @@ python ctx_proxy.py --stop
 | `--logs [-n N]` | Show the N most recent logged requests (default 30) |
 | `--today [--plan KEY]` | Today's token usage vs plan limits |
 | `--weekly [--plan KEY]` | This week's token usage vs plan limits |
+| `--inspect [N]` | Show full input + output of exchange #N (1 = most recent). Omit N to list recent exchanges. |
 | `--analyze FILE` | Analyse a saved `.jsonl` or `.json` session file |
 | `--cost [--since PERIOD] [--mode MODE] [--by GROUP]` | Cost report |
 | `--setup` | Print instructions for connecting Claude Code |
@@ -82,6 +83,28 @@ Commands:  s=send  d <n>=drop msg  t <n>=trim msg  r=re-show  j=save JSON  x=abo
 | `r` | Re-display the current context analysis |
 | `j` | Save the full JSON payload to disk |
 | `x` | Abort the request (returns an error to Claude Code) |
+
+## Inspecting exchanges
+
+`--inspect` lets you read the actual text content of any logged exchange — the full system prompt, every input message, and the assistant's response.
+
+```bash
+# List recent exchanges with index numbers
+python ctx_proxy.py --inspect
+
+# View the most recent exchange in full
+python ctx_proxy.py --inspect 1
+
+# View the 5th most recent exchange
+python ctx_proxy.py --inspect 5
+```
+
+Each exchange shows:
+- **System prompt** — the full system instructions sent to the model
+- **Input messages** — every message in the conversation, with role, token count, and full text
+- **Response** — the assistant's complete output
+
+Long messages are truncated at 4 000 characters in the display. Use `--analyze FILE` on the raw `.jsonl` file for untruncated access.
 
 ## Cost tracking
 

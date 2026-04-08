@@ -1262,6 +1262,174 @@ def cmd_logs(n=30):
         print(f"\nFiles: {LOG_DIR}")
 
 
+def cmd_inspect(entry_idx):
+    """
+    Show the full input/output content of a logged exchange.
+    entry_idx=None → print a numbered list; entry_idx=N → show that exchange.
+    """
+    files = sorted(LOG_DIR.glob("*.jsonl"), reverse=True) if LOG_DIR.exists() else []
+    if not files:
+        print("No session logs yet. Start the proxy and send some requests.")
+        return
+
+    entries = []
+    for f in files:
+        for line in reversed(f.read_text().splitlines()):
+            if line.strip():
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+        if len(entries) >= 200:
+            break
+
+    if not entries:
+        print("No entries found.")
+        return
+
+    # ── List mode ─────────────────────────────────────────────────────────────
+    if entry_idx is None:
+        n_show = min(20, len(entries))
+        if HAS_RICH:
+            t = Table(title=f"Recent {n_show} exchanges  (run --inspect N to view full content)",
+                      box=rich_box.SIMPLE_HEAVY, header_style="bold cyan", border_style="dim")
+            t.add_column("#",       width=4,  style="bold")
+            t.add_column("Time",    width=19)
+            t.add_column("Model",   width=22)
+            t.add_column("In",      width=8,  justify="right")
+            t.add_column("Out",     width=7,  justify="right")
+            t.add_column("Msgs",    width=5,  justify="right")
+            for i, e in enumerate(entries[:n_show], 1):
+                ts    = e.get("ts","")[:19].replace("T"," ")
+                model = e.get("model","?")[:21]
+                u     = e.get("usage",{}) or {}
+                in_t  = f"{u['input_tokens']:,}"  if "input_tokens"  in u else "–"
+                out_t = f"{u['output_tokens']:,}" if "output_tokens" in u else "–"
+                msgs  = str(len((e.get("request") or {}).get("messages", [])))
+                t.add_row(str(i), ts, model, in_t, out_t, msgs)
+            console.print(t)
+        else:
+            n_show = min(20, len(entries))
+            print(f"\n  #   Time                 Model                     In        Out   Msgs")
+            print("  " + "─"*72)
+            for i, e in enumerate(entries[:n_show], 1):
+                ts    = e.get("ts","")[:19].replace("T"," ")
+                model = e.get("model","?")[:24]
+                u     = e.get("usage",{}) or {}
+                in_t  = str(u.get("input_tokens","–"))
+                out_t = str(u.get("output_tokens","–"))
+                msgs  = str(len((e.get("request") or {}).get("messages", [])))
+                print(f"  {i:>3}  {ts:<20} {model:<24} {in_t:>9}  {out_t:>7}  {msgs:>4}")
+            print(f"\n  Run --inspect N to view exchange #N in full.\n")
+        return
+
+    # ── Detail mode ───────────────────────────────────────────────────────────
+    idx = entry_idx - 1
+    if idx < 0 or idx >= len(entries):
+        print(f"Exchange #{entry_idx} not found ({len(entries)} available).")
+        return
+
+    e    = entries[idx]
+    req  = e.get("request", {}) or {}
+    resp = e.get("response", {}) or {}
+    ts   = e.get("ts","")[:19].replace("T"," ")
+    model = e.get("model","?")
+    u     = e.get("usage",{}) or {}
+
+    role_colors = {"user":"blue", "assistant":"green", "system":"yellow"}
+
+    def _truncate(text, limit=4000):
+        if len(text) <= limit:
+            return text, False
+        return text[:limit], True
+
+    if HAS_RICH:
+        console.print(Panel(
+            f"[bold]{model}[/]  [dim]·  {ts}  ·  "
+            f"in {u.get('input_tokens','–')}  out {u.get('output_tokens','–')} tokens[/]",
+            title=f"[bold cyan]Exchange #{entry_idx} of {len(entries)}[/]",
+            border_style="cyan"
+        ))
+
+        # System prompt
+        sys_raw  = req.get("system","")
+        sys_text = sys_raw if isinstance(sys_raw, str) else \
+                   " ".join(b.get("text","") for b in (sys_raw or []) if isinstance(b, dict))
+        if sys_text.strip():
+            clipped, was_clipped = _truncate(sys_text)
+            suffix = "\n[dim]… (truncated — use --analyze for full view)[/]" if was_clipped else ""
+            console.print(Panel(f"[dim]{clipped}[/]{suffix}",
+                                title="[yellow]system[/]", border_style="yellow"))
+
+        # Input messages
+        messages = req.get("messages", [])
+        for i, msg in enumerate(messages):
+            role  = msg.get("role","?")
+            text  = get_content_text(msg.get("content",""))
+            toks  = estimate_tokens(text)
+            color = role_colors.get(role, "white")
+            clipped, was_clipped = _truncate(text)
+            suffix = "\n[dim]… (truncated)[/]" if was_clipped else ""
+            console.print(Panel(
+                f"{clipped}{suffix}",
+                title=f"[{color}]msg #{i}  {role}[/]  [dim]{toks:,} tok[/]",
+                border_style=color,
+            ))
+
+        # Response output
+        resp_content = resp.get("content", [])
+        if resp_content:
+            resp_text = get_content_text(resp_content)
+            if resp_text.strip():
+                clipped, was_clipped = _truncate(resp_text)
+                suffix = "\n[dim]… (truncated)[/]" if was_clipped else ""
+                console.print(Panel(
+                    f"{clipped}{suffix}",
+                    title=f"[green]response  assistant[/]  "
+                          f"[dim]{u.get('output_tokens','–')} tok[/]",
+                    border_style="green",
+                ))
+            else:
+                console.print("[dim]  (response recorded but no text content)[/]")
+        else:
+            console.print("[dim]  (no response content logged)[/]")
+
+    else:
+        sep = "─" * 70
+        print(f"\n{sep}")
+        print(f"  Exchange #{entry_idx} of {len(entries)}  —  {model}  —  {ts}")
+        print(f"  Tokens: in={u.get('input_tokens','–')}  out={u.get('output_tokens','–')}")
+        print(f"{sep}\n")
+
+        sys_raw  = req.get("system","")
+        sys_text = sys_raw if isinstance(sys_raw, str) else \
+                   " ".join(b.get("text","") for b in (sys_raw or []) if isinstance(b, dict))
+        if sys_text.strip():
+            clipped, was_clipped = _truncate(sys_text)
+            print(f"── SYSTEM ──")
+            print(clipped + ("  ...(truncated)" if was_clipped else ""))
+            print()
+
+        for i, msg in enumerate(req.get("messages", [])):
+            role  = msg.get("role","?")
+            text  = get_content_text(msg.get("content",""))
+            toks  = estimate_tokens(text)
+            clipped, was_clipped = _truncate(text)
+            print(f"── MSG #{i}  [{role.upper()}]  {toks:,} tok ──")
+            print(clipped + ("  ...(truncated)" if was_clipped else ""))
+            print()
+
+        resp_content = resp.get("content", [])
+        if resp_content:
+            resp_text = get_content_text(resp_content)
+            clipped, was_clipped = _truncate(resp_text)
+            print(f"── RESPONSE [ASSISTANT]  {u.get('output_tokens','–')} tok ──")
+            print(clipped + ("  ...(truncated)" if was_clipped else ""))
+        else:
+            print("  (no response content logged)")
+        print()
+
+
 def cmd_analyze(filepath):
     p = Path(filepath)
     if not p.exists():
@@ -1643,6 +1811,9 @@ examples:
   python ctx_proxy.py --setup            how to connect Claude Code
   python ctx_proxy.py --remove           how to fully uninstall
   python ctx_proxy.py --interactive      foreground pause mode (manual trimming)
+  python ctx_proxy.py --inspect          list recent exchanges
+  python ctx_proxy.py --inspect 1        show full input+output of most recent exchange
+  python ctx_proxy.py --inspect 3        show full input+output of 3rd most recent exchange
 """)
 
     g = p.add_mutually_exclusive_group()
@@ -1660,6 +1831,10 @@ examples:
     g.add_argument("--analyze",     metavar="FILE",       help="Analyse a .jsonl or .json session file")
     g.add_argument("--cost",        action="store_true",
                    help="Show cost report (use --since, --mode, --by to refine)")
+    g.add_argument("--inspect",     nargs="?", type=int, const=None, metavar="N",
+                   default=argparse.SUPPRESS,
+                   help="Show full input+output of exchange #N (1=most recent). "
+                        "Omit N to list recent exchanges.")
 
     p.add_argument("--port", "-p", type=int, default=dport,
                    help=f"Port to listen on (default: {dport})")
@@ -1687,6 +1862,7 @@ examples:
     if args.weekly:      cmd_weekly(args.plan);           return
     if args.analyze:     cmd_analyze(args.analyze);       return
     if args.cost:        cmd_cost(args.since, args.mode, args.by); return
+    if hasattr(args, "inspect"): cmd_inspect(args.inspect);       return
 
     if args.interactive:
         INTERACTIVE = True
