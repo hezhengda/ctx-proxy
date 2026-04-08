@@ -12,6 +12,8 @@ Claude Code  →  http://localhost:7899  →  api.anthropic.com
 
 Set `ANTHROPIC_BASE_URL=http://localhost:7899` and Claude Code routes all API traffic through the proxy. Requests are forwarded unchanged in passthrough mode; in interactive mode the proxy pauses so you can drop or trim messages before they are sent.
 
+![ctx-proxy --logs output showing per-request token and cost breakdown](screenshot.png)
+
 ## Requirements
 
 - Python 3.8+
