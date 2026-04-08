@@ -1011,9 +1011,15 @@ def print_usage_report(entries, title, plan_key):
     }
 
     # Grand totals across all clients
-    grand_in  = sum(v["input"]  for v in totals.values())
-    grand_out = sum(v["output"] for v in totals.values())
-    grand_calls = sum(v["calls"] for v in totals.values())
+    grand_in         = sum(v["input"]       for v in totals.values())
+    grand_out        = sum(v["output"]      for v in totals.values())
+    grand_calls      = sum(v["calls"]       for v in totals.values())
+    grand_cache_read = sum(v["cache_read"]  for v in totals.values())
+    grand_cache_write= sum(v["cache_write"] for v in totals.values())
+    # Effective tokens for plan-limit hour estimation: the model processes all
+    # context window tokens regardless of caching.  Cache reads are 10x cheaper
+    # in cost but still fill the context window, so we include them.
+    effective_in = grand_in + grand_cache_read + grand_cache_write
 
     if HAS_RICH:
         from rich.columns import Columns
@@ -1061,10 +1067,9 @@ def print_usage_report(entries, title, plan_key):
 
         if wson:
             lo, hi = wson
-            mid = (lo + hi) / 2
-            # We estimate active hours as: total_tokens / avg_tokens_per_hour
-            # ~40k tokens/hour is a rough active-use estimate for Sonnet
-            est_hours = grand_in / 40_000
+            # Use effective_in (input + cache_read + cache_write) — the model
+            # processes all context-window tokens regardless of caching.
+            est_hours = effective_in / 40_000
             bar, pct = _progress_bar(est_hours, hi)
             console.print(
                 f"  [dim]weekly Sonnet hrs[/]  {bar}  "
@@ -1073,12 +1078,15 @@ def print_usage_report(entries, title, plan_key):
 
         if wops:
             lo, hi = wops
-            # Opus tokens cost ~1.7x more compute; rough estimate
             opus_entries = [e for e in entries
                             if "opus" in e.get("model","").lower()]
-            opus_in    = sum((e.get("usage") or {}).get("input_tokens", 0)
-                             for e in opus_entries)
-            opus_hours = opus_in / 40_000
+            opus_effective = sum(
+                (e.get("usage") or {}).get("input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_read_input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
+                for e in opus_entries
+            )
+            opus_hours = opus_effective / 40_000
             bar, pct   = _progress_bar(opus_hours, hi)
             console.print(
                 f"  [dim]weekly Opus hrs  [/]  {bar}  "
@@ -1089,8 +1097,8 @@ def print_usage_report(entries, title, plan_key):
             console.print("  [dim]API plan: no weekly cap — billed per token[/]")
 
         console.print(
-            f"\n  [dim]Note: hour estimates = input_tokens ÷ 40k "
-            f"(rough active-use baseline). Actual limits vary by task complexity.[/]\n"
+            f"\n  [dim]Note: hour estimates = (input + cache_read + cache_write) ÷ 40k "
+            f"(all context-window tokens). Actual limits vary by task complexity.[/]\n"
         )
 
     else:
@@ -1107,16 +1115,18 @@ def print_usage_report(entries, title, plan_key):
         wson = plan.get("weekly_sonnet")
         if wson:
             lo, hi = wson
-            est = grand_in / 40_000
+            est = effective_in / 40_000
             print(f"\n  Weekly Sonnet: {_plain_bar(est, hi)}  {est:.1f} / {lo}–{hi} hr est.")
         wops = plan.get("weekly_opus")
         if wops:
             lo, hi = wops
-            opus_in = sum(
+            opus_effective = sum(
                 (e.get("usage") or {}).get("input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_read_input_tokens", 0)
+                + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
                 for e in entries if "opus" in e.get("model","").lower()
             )
-            est = opus_in / 40_000
+            est = opus_effective / 40_000
             print(f"  Weekly Opus:   {_plain_bar(est, hi)}  {est:.1f} / {lo}–{hi} hr est.")
         print()
 
