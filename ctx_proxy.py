@@ -1840,7 +1840,7 @@ examples:
                    help=f"Port to listen on (default: {dport})")
     p.add_argument("-n",           type=int, default=30,
                    help="Entries to show with --logs (default: 30)")
-    p.add_argument("--plan",       default="max5",
+    p.add_argument("--plan",       default="max20",
                    choices=list(PLAN_LIMITS.keys()),
                    help="Your subscription plan for quota bars (default: max5)")
     p.add_argument("--since",      default="month",
