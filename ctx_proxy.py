@@ -1050,6 +1050,22 @@ def print_usage_report(entries, title, plan_key):
         ))
         console.print(Columns(cards, equal=True))
 
+        # ── Token breakdown ───────────────────────────────────────────────────
+        total_ctx = effective_in + grand_out
+        cache_pct = (grand_cache_read / effective_in * 100) if effective_in else 0
+        console.print(
+            f"  [bold]Context window:[/]  "
+            f"[yellow]{grand_in:>12,}[/] [dim]input (new)[/]"
+            f"  [cyan]{grand_cache_read:>12,}[/] [dim]cache read  ({cache_pct:.0f}% of input)[/]"
+            f"  [dim]{grand_cache_write:>12,} cache write[/]"
+        )
+        console.print(
+            f"  [bold]Output:        [/]  "
+            f"[green]{grand_out:>12,}[/] [dim]tokens[/]"
+            f"  [dim]│  total context: {effective_in:,}  │  effective_in / 40k = {effective_in/40_000:.1f} est. hrs[/]"
+        )
+        console.print()
+
         # ── Plan quota bars ───────────────────────────────────────────────────
         wlim = plan.get("window_tokens")
         wson = plan.get("weekly_sonnet")
@@ -1104,13 +1120,20 @@ def print_usage_report(entries, title, plan_key):
     else:
         print(f"\n{'─'*60}")
         print(f"  {title}")
-        print(f"  {grand_calls:,} calls  |  in {grand_in:,}  out {grand_out:,}")
+        print(f"  {grand_calls:,} calls  |  in {grand_in:,}  cache_read {grand_cache_read:,}  out {grand_out:,}")
         print(f"{'─'*60}")
         for c, label in CLIENT_LABELS.items():
             t = totals.get(c, {})
             if not t.get("calls"): continue
             print(f"  {label:<18}  calls={t['calls']:>4}  "
                   f"in={t['input']:>9,}  out={t['output']:>7,}")
+        cache_pct = (grand_cache_read / effective_in * 100) if effective_in else 0
+        print(f"\n  Token breakdown:")
+        print(f"    input (new)  : {grand_in:>12,}")
+        print(f"    cache read   : {grand_cache_read:>12,}  ({cache_pct:.0f}% of total context)")
+        print(f"    cache write  : {grand_cache_write:>12,}")
+        print(f"    output       : {grand_out:>12,}")
+        print(f"    total context: {effective_in:>12,}")
         plan = PLAN_LIMITS.get(plan_key, PLAN_LIMITS["api"])
         wson = plan.get("weekly_sonnet")
         if wson:
