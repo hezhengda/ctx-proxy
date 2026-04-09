@@ -911,27 +911,19 @@ def show_status(port):
 PLAN_LIMITS = {
     "pro": {
         "label":          "Pro ($20/mo)",
-        "window_tokens":  44_000,       # per 5-hour window
-        "weekly_sonnet":  (40, 80),     # hours range
-        "weekly_opus":    None,
+        "monthly_budget": 20.0,
     },
     "max5": {
         "label":          "Max 5x ($100/mo)",
-        "window_tokens":  88_000,
-        "weekly_sonnet":  (140, 280),
-        "weekly_opus":    (15, 35),
+        "monthly_budget": 100.0,
     },
     "max20": {
         "label":          "Max 20x ($200/mo)",
-        "window_tokens":  220_000,
-        "weekly_sonnet":  (240, 480),
-        "weekly_opus":    (24, 40),
+        "monthly_budget": 200.0,
     },
     "api": {
         "label":          "API (pay-as-you-go)",
-        "window_tokens":  None,
-        "weekly_sonnet":  None,
-        "weekly_opus":    None,
+        "monthly_budget": None,
     },
 }
 
@@ -982,22 +974,8 @@ def aggregate_entries(entries):
     return totals
 
 
-def _progress_bar(used, limit, width=28):
-    """Return a coloured ASCII progress bar string (rich markup)."""
-    pct   = min(used / limit, 1.0) if limit else 0
-    filled = int(pct * width)
-    color  = "green" if pct < 0.6 else "yellow" if pct < 0.85 else "red"
-    bar    = f"[{color}]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
-    return bar, pct
 
-
-def _plain_bar(used, limit, width=24):
-    pct    = min(used / limit, 1.0) if limit else 0
-    filled = int(pct * width)
-    return f"[{'#'*filled}{'.'*(width-filled)}] {pct*100:.0f}%"
-
-
-def print_usage_report(entries, title, plan_key):
+def print_usage_report(entries, title, plan_key, period_days=1):
     """Render a usage report for an arbitrary set of entries."""
     if not entries:
         print(f"No data for {title}.")
@@ -1016,28 +994,17 @@ def print_usage_report(entries, title, plan_key):
     grand_calls      = sum(v["calls"]       for v in totals.values())
     grand_cache_read = sum(v["cache_read"]  for v in totals.values())
     grand_cache_write= sum(v["cache_write"] for v in totals.values())
-    # Effective tokens for plan-limit hour estimation.
-    # Cache reads are billed at 0.1× the rate of input tokens (precomputed KV
-    # cache is ~10× cheaper to process).  We apply the same 0.1× weight here
-    # so the hour estimate reflects compute used, not raw context-window size.
-    # Cache writes count as normal input (they are fully computed on first use).
+    # Weighted context: cache reads cost 0.1× input tokens (precomputed KV cache).
     effective_in = grand_in + grand_cache_read * 0.1 + grand_cache_write
 
-    # Cumulative weighted tokens in the rolling 5-hour window — matches what
-    # Anthropic shows as "Current session" on the usage page.
-    from datetime import timedelta
-    window_start = datetime.now() - timedelta(hours=5)
-    window_used = 0
+    # Compute actual API cost from per-entry model + usage data.
+    prices = load_prices()
+    total_cost = 0.0
     for e in entries:
-        try:
-            ts_e = datetime.fromisoformat(e.get("ts", "")[:19])
-        except ValueError:
-            continue
-        if ts_e >= window_start:
-            u = e.get("usage", {}) or {}
-            window_used += (u.get("input_tokens", 0)
-                            + u.get("cache_read_input_tokens", 0) * 0.1
-                            + u.get("cache_creation_input_tokens", 0))
+        c = compute_cost(e.get("usage"), e.get("model", ""), prices)
+        if c:
+            total_cost += c["total"]
+    monthly_est = total_cost * (30.0 / max(period_days, 1))
 
     if HAS_RICH:
         from rich.columns import Columns
@@ -1084,59 +1051,33 @@ def print_usage_report(entries, title, plan_key):
         )
         console.print()
 
-        # ── Plan quota bars ───────────────────────────────────────────────────
-        wlim = plan.get("window_tokens")
-        wson = plan.get("weekly_sonnet")
-        wops = plan.get("weekly_opus")
-
-        console.print(f"\n[bold]Plan:[/] [dim]{plan['label']}[/]")
-
-        if wlim:
-            # Show rolling 5-hr usage without a progress bar — Anthropic's
-            # exact window budget is unknown (window_tokens is context-size cap,
-            # not the rolling budget).  Compare raw number to claude.ai usage page.
-            console.print(
-                f"  [dim]5-hr window (cur)  [/]  "
-                f"[yellow]{int(window_used):,}[/][dim] weighted tokens in last 5 hrs  "
-                f"(ctx cap: {wlim:,})[/]"
-            )
-
-        if wson:
-            lo, hi = wson
-            # Use effective_in (input + cache_read + cache_write) — the model
-            # processes all context-window tokens regardless of caching.
-            est_hours = effective_in / 40_000
-            bar, pct = _progress_bar(est_hours, hi)
-            console.print(
-                f"  [dim]weekly Sonnet hrs[/]  {bar}  "
-                f"[yellow]{est_hours:.1f}[/][dim] est. / {lo}–{hi} hr limit[/]"
-            )
-
-        if wops:
-            lo, hi = wops
-            opus_entries = [e for e in entries
-                            if "opus" in e.get("model","").lower()]
-            opus_effective = sum(
-                (e.get("usage") or {}).get("input_tokens", 0)
-                + (e.get("usage") or {}).get("cache_read_input_tokens", 0) * 0.1
-                + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
-                for e in opus_entries
-            )
-            opus_hours = opus_effective / 40_000
-            bar, pct   = _progress_bar(opus_hours, hi)
-            console.print(
-                f"  [dim]weekly Opus hrs  [/]  {bar}  "
-                f"[yellow]{opus_hours:.1f}[/][dim] est. / {lo}–{hi} hr limit[/]"
-            )
-
-        if plan_key == "api":
-            console.print("  [dim]API plan: no weekly cap — billed per token[/]")
-
+        # ── Cost vs subscription budget ───────────────────────────────────────
+        budget = plan.get("monthly_budget")
+        console.print(f"\n[bold]Cost[/] [dim]({plan['label']})[/]")
         console.print(
-            f"\n  [dim]Note: hour estimates = (input + cache_write + cache_read×0.1) ÷ 40k  "
-            f"(cache reads weighted at 0.1× — their billing ratio). "
-            f"Actual limits vary by task complexity.[/]\n"
+            f"  [dim]actual ({period_days}d)  [/]  "
+            f"[bold cyan]{_fmt_usd(total_cost)}[/]"
         )
+        if budget:
+            diff = monthly_est - budget
+            if diff >= 0:
+                verdict = f"[bold green]★ making money! (+{_fmt_usd(diff)})[/]"
+            else:
+                pct_used = monthly_est / budget * 100
+                verdict = f"[dim]{pct_used:.0f}% of subscription[/]"
+            console.print(
+                f"  [dim]monthly est.  [/]  "
+                f"[yellow]{_fmt_usd(monthly_est)}[/]"
+                f"  [dim](×{30/max(period_days,1):.1f})[/]  {verdict}"
+                f"  [dim]/ {_fmt_usd(budget)}/mo[/]"
+            )
+        else:
+            console.print(
+                f"  [dim]monthly est.  [/]  "
+                f"[yellow]{_fmt_usd(monthly_est)}[/]"
+                f"  [dim](×{30/max(period_days,1):.1f})[/]"
+            )
+        console.print()
 
     else:
         print(f"\n{'─'*60}")
@@ -1156,28 +1097,18 @@ def print_usage_report(entries, title, plan_key):
         print(f"    cache write  : {grand_cache_write:>12,}")
         print(f"    output       : {grand_out:>12,}")
         print(f"    raw ctx      : {raw_total_ctx:>12,}")
-        print(f"    weighted ctx : {int(effective_in):>12,}  (cache_read×0.1 for hr est.)")
-        plan = PLAN_LIMITS.get(plan_key, PLAN_LIMITS["api"])
-        wlim = plan.get("window_tokens")
-        if wlim:
-            print(f"\n  5-hr window (cur):  {int(window_used):,} weighted tokens in last 5 hrs"
-                  f"  (ctx cap: {wlim:,})")
-        wson = plan.get("weekly_sonnet")
-        if wson:
-            lo, hi = wson
-            est = effective_in / 40_000
-            print(f"\n  Weekly Sonnet: {_plain_bar(est, hi)}  {est:.1f} / {lo}–{hi} hr est.")
-        wops = plan.get("weekly_opus")
-        if wops:
-            lo, hi = wops
-            opus_effective = sum(
-                (e.get("usage") or {}).get("input_tokens", 0)
-                + (e.get("usage") or {}).get("cache_read_input_tokens", 0) * 0.1
-                + (e.get("usage") or {}).get("cache_creation_input_tokens", 0)
-                for e in entries if "opus" in e.get("model","").lower()
-            )
-            est = opus_effective / 40_000
-            print(f"  Weekly Opus:   {_plain_bar(est, hi)}  {est:.1f} / {lo}–{hi} hr est.")
+        print(f"    weighted ctx : {int(effective_in):>12,}  (cache_read×0.1)")
+        budget = plan.get("monthly_budget")
+        print(f"\n  Cost ({plan['label']}):")
+        print(f"    actual ({period_days}d)   : {_fmt_usd(total_cost):>10}")
+        if budget:
+            diff = monthly_est - budget
+            verdict = (f"★ making money! (+{_fmt_usd(diff)})" if diff >= 0
+                       else f"{monthly_est/budget*100:.0f}% of subscription")
+            print(f"    monthly est.  : {_fmt_usd(monthly_est):>10}  (×{30/max(period_days,1):.1f})"
+                  f"  {verdict}  / {_fmt_usd(budget)}/mo")
+        else:
+            print(f"    monthly est.  : {_fmt_usd(monthly_est):>10}  (×{30/max(period_days,1):.1f})")
         print()
 
 
@@ -1185,7 +1116,7 @@ def print_usage_report(entries, title, plan_key):
 def cmd_today(plan_key):
     today   = date.today()
     entries = load_entries_for_range(today, today)
-    print_usage_report(entries, f"Today  ({today.isoformat()})", plan_key)
+    print_usage_report(entries, f"Today  ({today.isoformat()})", plan_key, period_days=1)
 
 
 def cmd_weekly(plan_key):
@@ -1193,10 +1124,12 @@ def cmd_weekly(plan_key):
     today      = date.today()
     week_start = today - timedelta(days=today.weekday())   # Monday
     entries    = load_entries_for_range(week_start, today)
+    days_so_far = today.weekday() + 1   # Mon=1 … Sun=7
     print_usage_report(
         entries,
         f"This week  ({week_start.isoformat()} → {today.isoformat()})",
         plan_key,
+        period_days=days_so_far,
     )
 
 
@@ -1861,10 +1794,10 @@ examples:
   python ctx_proxy.py --start            start background daemon (passthrough)
   python ctx_proxy.py --stop             stop daemon
   python ctx_proxy.py --status           check if running
-  python ctx_proxy.py --today            today's usage vs plan limits
-  python ctx_proxy.py --today --plan pro today's usage, Pro plan limits
-  python ctx_proxy.py --weekly           this week's usage vs plan limits
-  python ctx_proxy.py --weekly --plan max20  Max 20x plan limits
+  python ctx_proxy.py --today            today's usage + API cost
+  python ctx_proxy.py --today --plan pro today's usage, Pro ($20/mo) budget
+  python ctx_proxy.py --weekly           this week's usage + API cost
+  python ctx_proxy.py --weekly --plan max20  Max 20x ($200/mo) budget
   python ctx_proxy.py --logs             show recent exchanges
   python ctx_proxy.py --logs -n 100      show last 100 exchanges
   python ctx_proxy.py --analyze FILE     deep-dive a session .jsonl file
@@ -1902,7 +1835,7 @@ examples:
                    help="Entries to show with --logs (default: 30)")
     p.add_argument("--plan",       default="max20",
                    choices=list(PLAN_LIMITS.keys()),
-                   help="Your subscription plan for quota bars (default: max5)")
+                   help="Your subscription plan for cost comparison (default: max20)")
     p.add_argument("--since",      default="month",
                    help="For --cost: today, yesterday, week, month, Nd, or YYYY-MM-DD (default: month)")
     p.add_argument("--mode",       default=None, choices=["oauth", "api_key"],
